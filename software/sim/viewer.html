@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>SITL: слежение за маркером</title>
+<style>
+body{margin:0;background:#1b1e22;color:#e8eaed;font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+#hud{position:absolute;left:12px;top:10px;background:rgba(20,22,26,.8);padding:10px 12px;border-radius:6px;min-width:260px;white-space:pre;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+#cam{position:absolute;right:12px;top:10px;width:400px;height:300px;border:1px solid #444;background:#000;image-rendering:auto}
+#help{position:absolute;left:12px;bottom:10px;color:#9aa;font-size:12px}
+canvas{display:block}
+</style></head><body>
+<div id="hud">подключение…</div>
+<img id="cam" alt="камера">
+<div id="help">ЛКМ — вращать · колесо — масштаб · ПКМ — сдвиг · клик по земле — переставить маркер · L — посадка · F — следить</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x1b1e22);
+const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.05, 500);
+const renderer = new THREE.WebGLRenderer({antialias:true}); renderer.setSize(innerWidth, innerHeight); document.body.appendChild(renderer.domElement);
+const controls = new THREE.OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
+camera.position.set(-8, 6, 8); controls.target.set(0, 0, 0);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445544, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, .6); sun.position.set(5, 10, 3); scene.add(sun);
+// Мир: three.js Y вверх. NED → three: x = east, y = -down, z = -north... используем: three.x = east, three.y = up, three.z = -north
+const ned2v = (n, e, d) => new THREE.Vector3(e, -d, -n);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshLambertMaterial({color: 0x3d5a40}));
+ground.rotation.x = -Math.PI/2; scene.add(ground);
+const grid = new THREE.GridHelper(200, 200, 0x6b8a6e, 0x4e6b52); grid.position.y = 0.005; scene.add(grid);
+// маркер: текстура из битмапа, приходит с сервера
+let markerMesh = null, markerSize = 0.5;
+function makeMarker(bitmap, size){
+  const n = bitmap.length, c = document.createElement('canvas'); c.width = c.height = n; const ctx = c.getContext('2d');
+  for (let i=0;i<n;i++) for (let j=0;j<n;j++){ ctx.fillStyle = bitmap[i][j] ? '#fff' : '#000'; ctx.fillRect(j, n-1-i, 1, 1); }
+  const tex = new THREE.CanvasTexture(c); tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter;
+  if (markerMesh) scene.remove(markerMesh);
+  const full = size * n / 6;   // с белым полем
+  markerMesh = new THREE.Mesh(new THREE.PlaneGeometry(full, full), new THREE.MeshLambertMaterial({map: tex}));
+  markerMesh.rotation.x = -Math.PI/2; markerMesh.position.y = 0.01; markerMesh.rotation.z = -Math.PI/2; scene.add(markerMesh);
+}
+// дрон: X-рама с дисками, нос — красный
+const drone = new THREE.Group();
+const armMat = new THREE.MeshLambertMaterial({color: 0x9aa0a6});
+for (const a of [45, 135, 225, 315]){
+  const arm = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.012, 0.03), armMat);
+  arm.rotation.y = THREE.MathUtils.degToRad(a); arm.position.set(Math.cos(THREE.MathUtils.degToRad(a))*0.09, 0, -Math.sin(THREE.MathUtils.degToRad(a))*0.09); drone.add(arm);
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(0.065, 24), new THREE.MeshBasicMaterial({color: 0xdddddd, transparent:true, opacity:.25, side:THREE.DoubleSide}));
+  disc.rotation.x = -Math.PI/2; disc.position.set(Math.cos(THREE.MathUtils.degToRad(a))*0.18, 0.02, -Math.sin(THREE.MathUtils.degToRad(a))*0.18); drone.add(disc);
+}
+drone.add(new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.05, 0.1), new THREE.MeshLambertMaterial({color: 0x3b6ea5})));
+const nose = new THREE.Mesh(new THREE.ConeGeometry(0.02, 0.06, 8), new THREE.MeshLambertMaterial({color: 0xd9542b}));
+nose.rotation.x = Math.PI/2; nose.position.set(0, 0, -0.14); drone.add(nose);   // −z = north = вперёд при yaw 0
+scene.add(drone);
+// пирамида обзора камеры (155°×115° — рисуем усечённо)
+const frLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: 0xffcc66, transparent:true, opacity:.6}));
+scene.add(frLines);
+// след
+const trailPts = []; const trail = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: 0x66ccff})); scene.add(trail);
+const hud = document.getElementById('hud'), cam = document.getElementById('cam');
+let ws, state = {};
+function connect(){
+  ws = new WebSocket('ws://localhost:8765');
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.marker_bitmap) makeMarker(m.marker_bitmap, m.marker_size || 0.5);
+    if (m.frame) cam.src = 'data:image/jpeg;base64,' + m.frame;
+    if (m.pose){
+      state = m;
+      const [n,e,d] = m.pose.pos; drone.position.copy(ned2v(n,e,d));
+      // углы: NED yaw вокруг down, pitch вокруг east, roll вокруг north. three: порядок ZYX в NED → применяем через кватернион
+      const q = new THREE.Quaternion();
+      const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,-1,0), m.pose.yaw);
+      const qp = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -m.pose.pitch);
+      const qr = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,-1), -m.pose.roll);
+      q.multiply(qy).multiply(qp).multiply(qr); drone.quaternion.copy(q);
+      if (m.marker && markerMesh){ markerMesh.position.x = m.marker[1]; markerMesh.position.z = -m.marker[0]; }
+      trailPts.push(drone.position.clone()); if (trailPts.length > 2000) trailPts.shift();
+      trail.geometry.setFromPoints(trailPts);
+      if (m.frustum){ const pts = m.frustum.map(p => ned2v(...p)); const o = drone.position; const segs = [];
+        for (const p of pts){ segs.push(o, p); } segs.push(pts[0],pts[1],pts[1],pts[2],pts[2],pts[3],pts[3],pts[0]);
+        frLines.geometry.setFromPoints(segs); }
+      hud.textContent = `режим  ${m.mode}   ${m.armed ? 'ARMED' : 'disarmed'}\nвысота ${(-d).toFixed(2)} м   скорость ${m.speed.toFixed(2)} м/с\nсостояние ${m.phase}\nмаркер ${m.seen ? 'виден' : 'НЕ виден'}   ошибка ${m.err == null ? '—' : m.err.toFixed(2) + ' м'}\nоценка маркера ${m.est ? m.est.map(v=>v.toFixed(2)).join(', ') : '—'}\nистина          ${m.marker ? m.marker.map(v=>v.toFixed(2)).join(', ') : '—'}\nкадры ${m.fps.toFixed(1)} fps   t=${m.t.toFixed(1)} с`;
+    }
+  };
+  ws.onclose = () => { hud.textContent = 'нет связи с симулятором, переподключение…'; setTimeout(connect, 1000); };
+}
+connect();
+// клик по земле → переставить маркер
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2(); let downAt = null;
+renderer.domElement.addEventListener('pointerdown', e => { downAt = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!downAt || Math.hypot(e.clientX-downAt[0], e.clientY-downAt[1]) > 4 || e.button !== 0) return;
+  mouse.set((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1); ray.setFromCamera(mouse, camera);
+  const hit = ray.intersectObject(ground)[0]; if (hit && ws && ws.readyState === 1) ws.send(JSON.stringify({marker: [-hit.point.z, hit.point.x]}));
+});
+addEventListener('keydown', e => { if (!ws || ws.readyState !== 1) return; if (e.key === 'l' || e.key === 'L') ws.send(JSON.stringify({land: true})); if (e.key === 'f' || e.key === 'F') ws.send(JSON.stringify({follow: true})); });
+addEventListener('resize', () => { camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+(function tick(){ controls.update(); renderer.render(scene, camera); requestAnimationFrame(tick); })();
+</script></body></html>
