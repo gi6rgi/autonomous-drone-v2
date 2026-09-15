@@ -1,0 +1,6 @@
+.venv/
+sim/run/
+sim/out/
+sim/gazebo/run/
+sim/gazebo/.gzpy/
+__pycache__/
